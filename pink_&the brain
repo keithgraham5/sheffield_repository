@@ -1,0 +1,1398 @@
+#!/bin/bash
+
+
+re='^[0-9]+$'
+############### Find version of pipeline
+script=`basename ${0}`
+echo $script
+if [[ $script =~ $re ]] ;
+then
+    job=`basename ${0}`
+    pipeline=`qstat -j ${job} | grep script_file | sed -e 's/\s\+//g' | cut -d ":" -f2`
+else
+    pipeline=$0
+fi
+
+folder=`dirname ${pipeline}`
+version=`git --git-dir="${folder}/.git" describe --tags|sed ':a;N;$!ba;s/\n/ /g'`
+
+if [ "${version}" == "" ] ;
+then
+    version="development version $pipeline"
+fi
+
+echo "WARNING: running with version ${version}"
+
+echo VERSION ${version}
+
+###########################################
+
+
+############### Function to check files for completeness
+
+function check_file {
+        file=$1
+        if [ ! -s ${file} ]
+        then
+            echo "FATAL ERROR: ${file} is empty"
+            exit
+        else
+            echo "INFO: ${file} is OK"
+        fi
+}
+
+###########################################
+
+
+################# Deal with multiple fastqs
+
+fastqs=$1
+
+IFS=', ' read -r -a array <<< "$fastqs"
+count="${#array[@]}"
+
+
+if [[ $count -eq 4 ]]
+then
+
+    fastq_1_1="${array[0]}"
+    fastq_1_2="${array[1]}"
+    fastq_2_1="${array[2]}"
+    fastq_2_2="${array[3]}"
+
+fi
+
+if [[ $count -eq 2 ]]
+then
+
+    fastq_1_1="${array[0]}"
+    fastq_1_2="${array[1]}"
+
+fi
+
+#########################################
+
+file_header=$2
+group=$3
+library=$4
+full_broad_panel_bed=$5
+full_small_panel_bed=$6
+req_depth=30
+intron_depth=18
+splice_interval=25
+poly_list=${7}
+year=${8}
+user_initials=${9}
+run_no=${10}
+full_trans_file=${11}
+dir=${12}
+rescoping=${13}
+exome=`echo ${14} | tr -d '\r'`
+
+exon_bed=${full_small_panel_bed/%.bed/_exonic.bed}  # replaces .bed at end of string with _exonic.bed
+#exon_bed=${change_bed/MasterBED/MasterBED\/exonic_files} # adds in the additional folder exonic_files to the file path
+
+worklist=${file_header%%-*} # returns the first part of the name up to the first hyphen (hence doesn't split at the sample suffix)
+sample=${file_header#*-} # returns the second part of the name after the first hyphen
+
+echo ${dir}
+
+if [ -d ${dir}/.tmp ]
+then
+    rm -r ${dir}/.tmp
+fi
+
+mkdir -p ${dir}/.tmp
+
+if [ "${rescoping}" == "True" ]
+then
+    location=${dir}
+else
+    location=${dir}/.tmp
+fi
+
+
+script_dir=/sdgs/software/pipeline/SDGSPipeline/scripts
+#script_dir=/home/gensk/wc/SDGSPipeline/scripts #Path to scripts for v3.4.3 testing
+
+perl_1=determining_read_and_insert_size.pl
+perl_2=extracting_regions_with_below_minimum_depth.pl
+perl_3=combine_VCFs.pl
+perl_4=simplifying_vcf_for_annovar.pl
+perl_5=adding_annovar_output_to_vcf_v2.pl
+bash_1=annotating_variants_with_annovar.sh
+
+broad_bed=${full_broad_panel_bed##*\/}
+small_bed=${full_small_panel_bed##*\/}
+short_exon_bed=${exon_bed##*\/}
+poly=${poly_list##*\/}
+trans_file=${full_trans_file##*\/}
+
+
+### reference for pinky pipeline v.3.4.1 ###
+reference=/sdgs/reference/ucsc.hg19.nohap.masked_v3.fasta
+dbsnp=/sdgs/reference/dbsnp/b150/00-All.vcf
+cosmic=/sdgs/reference/cosmic/v67/CosmicCodingMuts_v67_20131024.vcf
+exac_constraints=/sdgs/reference/exac/fordist_cleaned_exac_r03_march16_z_pli_rec_null_data.txt
+gnomad_constraints=/sdgs/reference/gnomad/gnomad.v2.1.1.lof_metrics.by_gene.json
+clinvar=/sdgs/reference/clinvar/clinvar_20190527.vcf.gz
+fastqc=/sdgs/software/FastQC/fastqc
+bwa=/sdgs/software/bwa-0.7.15/bwa
+samtools=/sdgs/software/samtools-1.7/samtools
+gatk=/sdgs/software/GenomeAnalysisTK-3.7/GenomeAnalysisTK.jar
+bamutil=/sdgs/software/bamUtil_1.0.13/bamUtil/bin/bam
+bedtools=/sdgs/software/bedtools2/bin/bedtools
+sambamba=/sdgs/software/sambamba_v0.6.7/sambamba
+picard=/sdgs/software/picard-tools-2.5.0
+snpeff=/sdgs/software/snpEff-4.3i/SnpSift.jar
+verifyBamId=/sdgs/software/verifyBamID_1.1.3/verifyBamID/bin/verifyBamID
+vcfanno=/sdgs/software/vcfanno_0.3.1/vcfanno_linux64
+vt=/sdgs/software/vt/vt
+
+
+annovar_path=/sdgs/software/annovar
+bcftools=/sdgs/software/bcftools-1.3.1/bcftools
+decon=DECoN-1.0.1
+
+
+vcfanno_config=/sdgs/software/pipeline/SDGSPipeline/resources/vcfanno_conf.toml ##Path on Pinky and the Brain
+
+
+python=/sdgs/software/virtualenvs/production/bin/python # virtual env on Pinyk and the Brain
+
+
+#get versions of required python packages
+pip=`echo ${python} | sed 's/python/pip/g'`
+sdgsdatamodels=`${pip} show SDGSDataModels | grep -w Version | grep -v Meta | cut -f2 -d" "`
+sdgscommonlibs=`${pip} show SDGSCommonLibs | grep -w Version | grep -v Meta | cut -f2 -d" "`
+sdgsopencga=`${pip} show SDGSOpenCGA | grep -w Version | grep -v Meta | cut -f2 -d" "`
+
+echo $dir/.tmp/${file_header}_provenance.txt
+
+echo "pipeline_command,$0 $@" > $dir/.tmp/${file_header}_provenance.txt
+echo "reference_genome,$reference" >> $dir/.tmp/${file_header}_provenance.txt
+echo "dbsnp,$dbsnp" >> $dir/.tmp/${file_header}_provenance.txt
+echo "cosmic,$cosmic" >> $dir/.tmp/${file_header}_provenance.txt
+#echo "gnomad,$gnomad" >> $dir/.tmp/${file_header}_provenance.txt
+echo "gnomad_constraints,$gnomad_constraints" >> $dir/.tmp/${file_header}_provenance.txt
+os=`lsb_release -a | grep Description: | cut -f2`
+echo "os,$os" >> $dir/.tmp/${file_header}_provenance.txt
+echo "python,$python" >> $dir/.tmp/${file_header}_provenance.txt
+echo "SDGSPipeline,$version" >> $dir/.tmp/${file_header}_provenance.txt
+echo "SDGSDataModels,$sdgsdatamodels" >> $dir/.tmp/${file_header}_provenance.txt
+echo "SDGSCommonLibs,$sdgscommonlibs" >> $dir/.tmp/${file_header}_provenance.txt
+echo "SDGSOpenCGA,$sdgsopencga" >> $dir/.tmp/${file_header}_provenance.txt
+echo "broad,$full_broad_panel_bed" >> $dir/.tmp/${file_header}_provenance.txt
+echo "small,$full_small_panel_bed" >> $dir/.tmp/${file_header}_provenance.txt
+echo "exonic,$exon_bed" >> $dir/.tmp/${file_header}_provenance.txt
+echo "poly,$poly_list" >> $dir/.tmp/${file_header}_provenance.txt
+echo "tx,$full_trans_file" >> $dir/.tmp/${file_header}_provenance.txt
+echo "fastqc,$fastqc" >> $dir/.tmp/${file_header}_provenance.txt
+echo "bwa,$bwa" >> $dir/.tmp/${file_header}_provenance.txt
+echo "picard,$picard" >> $dir/.tmp/${file_header}_provenance.txt
+echo "samtools,$samtools" >> $dir/.tmp/${file_header}_provenance.txt
+echo "gatk,$gatk" >> $dir/.tmp/${file_header}_provenance.txt
+echo "snpeff,$snpeff" >> $dir/.tmp/${file_header}_provenance.txt
+echo "bamutil,$bamutil" >> $dir/.tmp/${file_header}_provenance.txt
+echo "bedtools,$bedtools" >> $dir/.tmp/${file_header}_provenance.txt
+echo "sambamba,$sambamba" >> $dir/.tmp/${file_header}_provenance.txt
+echo "verifyBamId,$verifyBamId" >> $dir/.tmp/${file_header}_provenance.txt
+echo "vcfanno,$vcfanno" >> $dir/.tmp/${file_header}_provenance.txt
+echo "vt,$vt" >> $dir/.tmp/${file_header}_provenance.txt
+echo "bcftools,$bcftools" >> $dir/.tmp/${file_header}_provenance.txt
+echo "DECoN (pinky), $decon" >> $dir/.tmp/${file_header}_provenance.txt
+echo "CLINVAR, $clinvar" >> $dir/.tmp/${file_header}_provenance.txt
+
+
+echo $dir/.tmp/${file_header}_provenance.txt > $dir/.tmp/to_copy
+
+########################
+# Checking input files
+########################
+
+#get expected insert length for library method
+if [ $library = "TruSight" ]; then
+	exp_ins=300
+elif [ $library = "SureSelect" ]; then
+	exp_ins=200
+else
+	echo "Error the wrong parameter has been entered for library type (argument 7). Consult the relevant standard operating procedure for correct usage."
+	exit 1  # exit terminates script
+fi
+
+#Check that 14 parameters have been passed
+if [ $# -ne 14 ]
+then
+        echo "Error - incorrect number of parameters.  Consult the relevant standard operating procedure for correct usage."
+		exit 1
+fi
+
+if [ $rescoping == "False" ]
+then
+
+    #Check that the first fastq exists
+    test -e "${fastq_1_1}"
+    if [ $? -ne 0 ]
+    then
+            echo "Error - ${fastq_1_1} does not exist.  Please check the complete file path and re-run."
+        exit 1
+    fi
+
+    #Check that the second fastq exists
+    test -e "${fastq_1_2}"
+    if [ $? -ne 0 ]
+    then
+            echo "Error - ${fastq_1_2} does not exist.  Please check the complete file path and re-run."
+            exit 1
+    fi
+
+    if [[ $count -eq 4 ]]
+    then
+        #Check that the third fastg exists
+        test -e "${fastq_2_1}"
+        if [ $? -ne 0 ]
+        then
+                echo "Error - ${fastq_2_1} does not exist.  Please check the complete file path and re-run."
+            exit 1
+        fi
+
+        #Check that the fourth fastq exists
+        test -e "${fastq_2_2}"
+        if [ $? -ne 0 ]
+        then
+                echo "Error - ${fastq_2_2} does not exist.  Please check the complete file path and re-run."
+                exit 1
+        fi
+    fi
+fi
+
+if [ "${exome}" == "False" ]
+then
+
+    # check that the first two fastqs are from lane 1
+    if [[ ! $fastq_1_1 =~ L001 ]]; then
+        echo "Error the first fastq is not from lane 1"
+        exit 1
+    fi
+
+    if [[ ! $fastq_1_2 =~ L001 ]]; then
+        echo "Error the second fastq is not from lane 1"
+        exit 1
+    fi
+
+
+    if [[ $count -eq 4 ]]
+    then
+
+        # check that the second two fastqs are from lane 2
+        if [[ ! $fastq_2_1 =~ L002 ]]; then
+            echo "Error the third fastq is not from lane 2"
+            exit 1
+        fi
+
+        if [[ ! $fastq_2_2 =~ L002 ]]; then
+            echo "Error the fourth fastq is not from lane 2"
+            exit 1
+        fi
+
+    fi
+fi
+
+# Check that the two fastq files for each lane have identical names with exception of one being R1 and one R2
+if [[ $fastq_1_1 == $fastq_1_2 ]]; then
+	echo "Error - the first two fastqs have the same name"
+	exit 1
+fi
+
+
+if [[ $count -eq 4 ]]
+then
+    if [[ $fastq_2_1 == $fastq_2_2 ]]; then
+        echo "Error - the second two fastqs have the same name"
+        exit 1
+    fi
+fi
+
+# check that the first fastq for each pair contains R1 and the second contains R2
+if [[ ! $fastq_1_1 =~ R1 ]]; then
+	echo "Error - the first fastq is not from read 1 (name doesn't contain R1)"
+	exit 1
+fi
+
+if [[ ! $fastq_1_2 =~ R2 ]]; then
+	echo "Error - the second fastq is not from read 2 (name doesn't contain R2)"
+	exit 1
+fi
+
+if [[ $count -eq 4 ]]
+then
+    if [[ ! $fastq_2_1 =~ R1 ]]; then
+        echo "Error - the third fastq is not from read 1 (name doesn't contain R1)"
+        exit 1
+    fi
+
+    if [[ ! $fastq_2_2 =~ R2 ]]; then
+        echo "Error - the fourth fastq is not from read 2 (name doesn't contain R2)"
+        exit 1
+    fi
+fi
+
+# check that the two sets of fastqs are paired
+tmp=${fastq_1_1/R1/R2} # substitute R1 for R2 in first fastq
+if [[ $tmp != $fastq_1_2 ]]; then
+	echo "Error - The first two fastq files are not paired (they should have nearly identical names with one containing R1 and the other containing R2)"
+	exit 1
+fi
+
+if [[ $count -eq 4 ]]
+then
+
+    tmp=${fastq_2_1/R1/R2} # substitute R1 for R2 in third fastq
+    if [[ $tmp != $fastq_2_2 ]]; then
+        echo "Error - The second two fastq files are not paired (they should have nearly identical names with one containing R1 and the other containing R2)"
+        exit 1
+    fi
+fi
+
+if [[ $count -eq 4 ]]
+then
+    # check that the two
+    # sets of fastq are for the same sample
+    tmp=${fastq_1_1/L001/L002} # substitute L001 for L002 in first fastq
+    if [[ $tmp != $fastq_2_1 ]]; then
+        echo "Error - The first and second pairs of fastqs do not seem to be from the same sample (they should have nearly identical names with one containing L001 and the other containing L002)"
+        exit 1
+    fi
+fi
+
+if [ "${exome}" == "False" ]
+then
+    #Check that the worklist number and patient ID are matched between $1 $2 and $5 (next 2 if statements)
+    if [[ "${fastq_1_1}" != *"${file_header}"* ]]
+    then
+        echo "Error - The fifth parameter appears to be incorrect.  Please enter the fifth parameter as follows: [WORKLIST_NUMBER]-[PATIENT_ID] where [WORKLIST_NUMBER] and [PATIENT_ID] match those of the FASTQ raw data files."
+        exit 1
+    fi
+
+    if [[ "${fastq_1_2}" != *"${file_header}"* ]]
+    then
+            echo "Error - The fifth parameter appears to be incorrect.  Please enter the fifth parameter as follows: [WORKLIST_NUMBER]-[PATIENT_ID] where [WORKLIST_NUMBER] and [PATIENT_ID] match those of both FASTQ raw data files used as the first and second parameters."
+            exit 1
+    fi
+fi
+#Check that the broad panel bed file exists
+test -e $full_broad_panel_bed
+if [ $? -ne 0 ]
+then
+        echo "Error - ${full_broad_panel_bed} does not exist.  Please check the complete file path and re-run."
+        echo "Note:  BED files are stored in the following directory:  /sdgs/reference/bed/"
+        exit 1
+fi
+
+#Check that the small panel bed file exists
+test -e $full_small_panel_bed
+if [ $? -ne 0 ]
+then
+        echo "Error - ${full_small_panel_bed} does not exist.  Please check the complete file path and re-run."
+        echo "Note:  BED files are stored in the following directory:  /sdgs/reference/bed/"
+        exit 1
+fi
+
+#Check that the poly list file exists
+test -e $poly_list
+if [ $? -ne 0 ]
+then
+        echo "Error - ${poly_list} does not exist.  Please check the complete file path and re-run."
+        echo "Note:  Polymorphism lists are stored in the following directory:  /sdgs/reference/masterpolylists/VCFs/"
+        exit 1
+fi
+
+#Check that the exonic bed file exists
+if [ ! -e $exon_bed ]
+then
+        echo "Error - $exon_bed does not exist.  Please check the complete file path and re-run."
+        echo "Note:  exonic BED files are stored in the directory /sdgs/reference/bed/"
+        exit 1
+fi
+
+#Check that the preferred transcript file exists
+if [ ! -e $full_trans_file ]
+then
+        echo "Error - ${full_trans_file} does not exist.  Please check the complete file path and re-run."
+        echo "Note:  Preferred transcript files are stored in the directory /sdgs/reference/mastertranscripts/"
+        exit 1
+fi
+
+
+# check that can find bed file abbreviation from file
+bed_abbrev=$(grep $small_bed /sdgs/reference/bed/abbreviated_bed_names.txt | cut -f2)
+if [ -z $bed_abbrev ] # if string is null prints an error
+then
+	echo "Error - abbreviated name is not defined for the bed file ${small_bed}. Please contact the bioinformatician"
+	exit 1
+fi
+
+echo $dir/$bed_abbrev
+
+if [ "${rescoping}" == "True" ]
+then
+    # check if a folder already exists with this name
+    if [[ -d $dir/$bed_abbrev ]] # already have a directory with this name
+    then
+        subs=$(ls -d $dir/*/ | grep ${bed_abbrev}_v)
+        if [ -n "$subs" ] # there exist additional versions of the directory
+        then
+            max=2
+            for s in $subs
+            do
+                chopped=${s%/} # remove trailing slash
+                panel_version=${chopped##*_v} # take part after the last v
+                if [ $panel_version -gt $max ]
+                then
+                    max=$panel_version
+                fi
+            done
+            suf=$((max+1))
+            bed_abbrev=${bed_abbrev}_v$suf # add a version number to the folder
+        else
+            bed_abbrev=${bed_abbrev}_v2
+        fi
+    fi
+fi
+
+echo $dir/$bed_abbrev
+
+mkdir -m 777 $dir/$bed_abbrev
+
+####################
+# log file
+####################
+
+if [ "${rescoping}" == "True" ]
+then
+    type="Re-Analysis"
+    if [ ! -f $dir/${file_header}_NGSPatient.json ]
+    then
+        ${python} $script_dir/reanalysis_helper.py --analysis_log $dir/${file_header}_analysis_log.txt --output_file $dir/${file_header}_NGSPatient.json --broad_bed ${broad_bed}
+    else
+        # rm $dir/${file_header}_NGSPatient.json
+        ${python} $script_dir/reanalysis_helper.py --json_file ${dir}/${file_header}_NGSPatient.json --analysis_log $dir/${file_header}_analysis_log.txt --output_file $dir/${file_header}_NGSPatient.json --broad_bed ${broad_bed}
+#    else
+#        echo "json model already exists, add to it"
+#        ${python} $script_dir/reanalysis_helper.py --json_file $dir/${file_header}_NGSPatient.json --output_file $dir/${file_header}_NGSPatient.json --broad_bed ${broad_bed}
+    fi
+    if [ $? -eq 1 ]
+    then
+        echo "Broad bed file does not match original.  Analysis can not continue - rerun a new analysis from scratch with your new broad bed"
+        exit
+    else:
+        echo "Broad bed's match - continuing with analysis"
+    fi
+else
+    type="Analysis"
+fi
+
+echo `date +"%a %b %d %T %Z %Y"`
+echo -e "${type} run by "${user_initials}" on `date +"%a %b %d %T %Z %Y"` using script "${pipeline}" ("${version}") with additional scripts "${perl_1}", "${perl_2}", $perl_3, $bash_1, $perl_4 and $perl_5" >> $dir/${file_header}_analysis_log.txt
+echo -e "Full Commmand: $0 $@" >> $dir/${file_header}_analysis_log.txt
+echo "Parameters used were" >> $dir/${file_header}_analysis_log.txt
+echo -e "FASTQ file for lane 1 read 1 "${fastq_1_1}"" >> $dir/${file_header}_analysis_log.txt
+echo -e "FASTQ file for lane 1 read 2 "${fastq_1_2}"" >> $dir/${file_header}_analysis_log.txt
+echo -e "FASTQ file for lane 2 read 1 "${fastq_2_1}"" >> $dir/${file_header}_analysis_log.txt
+echo -e "FASTQ file for lane 2 read 2 "${fastq_2_2}"" >> $dir/${file_header}_analysis_log.txt
+echo -e "Worklist number and patient ID (hyphen separated) "${file_header}"" >> $dir/${file_header}_analysis_log.txt
+echo -e "Disease group "${group}"" >> $dir/${file_header}_analysis_log.txt
+echo -e "Library type "${library}"" >> $dir/${file_header}_analysis_log.txt
+echo -e "Broad-panel BED file ${broad_bed}" >> $dir/${file_header}_analysis_log.txt
+echo -e "small-panel BED file ${small_bed}" >> $dir/${file_header}_analysis_log.txt
+echo -e "Abbreviation for small panel ${bed_abbrev}" >> $dir/${file_header}_analysis_log.txt
+echo -e "preferred transcript file ${trans_file}" >> $dir/${file_header}_analysis_log.txt
+echo -e "Required depth for exons "${req_depth}"" >> $dir/${file_header}_analysis_log.txt
+echo -e "Required depth for introns "${intron_depth}"" >> $dir/${file_header}_analysis_log.txt
+echo -e "Splicing threshold (distance checked into introns) "${splice_interval}"" >> $dir/${file_header}_analysis_log.txt
+echo -e "Polymorphisms file $poly" >> $dir/${file_header}_analysis_log.txt
+echo -e "Run year $year" >> $dir/${file_header}_analysis_log.txt
+echo -e "Run number "${run_no}"" >> $dir/${file_header}_analysis_log.txt
+echo -e "exonic small-panel BED file "${short_exon_bed}"" >> $dir/${file_header}_analysis_log.txt
+
+
+
+if [ "${rescoping}" == "False" ]
+then
+    if [[ $count -eq 2 ]]
+    then
+
+        echo "fastqc"
+
+        mkdir ${dir}/fastqc
+
+        ${fastqc} $fastq_1_1 $fastq_1_2 --outdir=${dir}/fastqc/ --extract
+
+        echo "mapping"
+
+### Changing aligner to BWA MEM ###
+
+#        ${bwa} mem  -R "@RG\tID:${worklist}_${sample}_lane_1\tLB:${sample}_lib_1\tPL:illumina_HiSeq\tSM:${sample}\tPU:${worklist}_lane_1" \
+#        ${reference} $fastq_1_1 $fastq_1_2 |\
+#        ${samtools} view -bS - |\
+#        ${samtools} sort - -o $location/"${file_header}"_Aligned_Sorted.bam
+
+
+
+        ${bwa} aln -t 6 $reference $fastq_1_1 > $location/"${sample}"_R1_Aligned.sai
+
+        check_file $location/"${sample}"_R1_Aligned.sai
+
+        ${bwa} aln -t 6 $reference $fastq_1_2 > $location/"${sample}"_R2_Aligned.sai
+
+        check_file $location/"${sample}"_R2_Aligned.sai
+
+        RG=`echo "@RG\tID:${worklist}_${sample}\tLB:${sample}_lib_1\tPL:illumina\tSM:${sample}\tPU:${worklist}"`
+        ${bwa} sampe \
+            -r ${RG} \
+            $reference \
+            $location/"${sample}"_R1_Aligned.sai \
+            $location/"${sample}"_R2_Aligned.sai $fastq_1_1 $fastq_1_2 |
+            ${samtools} view -bS - |
+            ${samtools} sort - -o $location/"${file_header}"_Aligned_Sorted.bam
+
+        check_file $location/"${file_header}"_Aligned_Sorted.bam
+
+
+    fi
+
+
+    if [[ $count -eq 4 ]]
+    then
+
+        ##############################
+        # Alignment of each FASTQ
+        ##############################
+
+        echo "fastqc"
+
+        mkdir ${dir}/fastqc
+
+        ${fastqc} $fastq_1_1 $fastq_1_2 $fastq_2_1 $fastq_2_2 --outdir=${dir}/fastqc/ --extract
+
+#        ${bwa} mem  -R "@RG\tID:${worklist}_${sample}_lane_1\tLB:${sample}_lib_1\tPL:illumina_HiSeq\tSM:${sample}\tPU:${worklist}_lane_1" \
+#        ${reference} $fastq_1_1 $fastq_1_2 |\
+#        ${samtools} view -bhS - |\
+#        ${samtools} sort - -o $location/${sample}_lane_1_sorted.bam
+
+        ${bwa} aln -t 6 ${reference} $fastq_1_1 > $location/${sample}_lane_1_R1.sai
+
+        check_file $location/${sample}_lane_1_R1.sai
+
+        ${bwa} aln -t 6 ${reference} $fastq_1_2 > $location/${sample}_lane_1_R2.sai
+
+        check_file $location/${sample}_lane_1_R2.sai
+
+        ${bwa} sampe \
+            -r "@RG\tID:${worklist}_${sample}_lane_1\tLB:${sample}_lib_1\tPL:illumina_HiSeq\tSM:${sample}\tPU:${worklist}_lane_1" \
+            ${reference} \
+            $location/${sample}_lane_1_R1.sai \
+            $location/${sample}_lane_1_R2.sai \
+            $fastq_1_1 \
+            $fastq_1_2 |\
+            ${samtools} view -bhS - |\
+            ${samtools} sort - -o $location/${sample}_lane_1_sorted.bam
+
+        check_file $location/${sample}_lane_1_sorted.bam
+
+### Changing aligner to BWA MEM ###
+
+#        ${bwa} mem  -R "@RG\tID:${worklist}_${sample}_lane_1\tLB:${sample}_lib_1\tPL:illumina_HiSeq\tSM:${sample}\tPU:${worklist}_lane_1" \
+#        ${reference} $fastq_2_1 $fastq_2_2 |\
+#        ${samtools} view -bhS - |\
+#        ${samtools} sort - -o $location/${sample}_lane_2_sorted.bam
+
+        ${bwa} aln -t 6 ${reference} $fastq_2_1 > $location/${sample}_lane_2_R1.sai
+
+        check_file $location/${sample}_lane_2_R1.sai
+
+        ${bwa} aln -t 6 ${reference} $fastq_2_2 > $location/${sample}_lane_2_R2.sai
+
+        check_file $location/${sample}_lane_2_R2.sai
+
+        ${bwa} sampe \
+            -r "@RG\tID:${worklist}_${sample}_lane_2\tLB:${sample}_lib_1\tPL:illumina_HiSeq\tSM:${sample}\tPU:${worklist}_lane_2" \
+            ${reference} \
+            $location/${sample}_lane_2_R1.sai \
+            $location/${sample}_lane_2_R2.sai \
+            $fastq_2_1 \
+            $fastq_2_2 |\
+            ${samtools} view -bhS - |\
+            $samtools sort - -o $location/${sample}_lane_2_sorted.bam
+
+        check_file $location/${sample}_lane_2_sorted.bam
+
+        echo "lane alignment finished on `date +"%a %b %d %T %Z %Y"`" >> $dir/${file_header}_analysis_log.txt
+
+
+        ################################
+        # lane level BAM adjustments
+        ################################
+
+        ${samtools} index $location/${sample}_lane_1_sorted.bam
+
+        ${samtools} index $location/${sample}_lane_2_sorted.bam
+
+        echo "Adjustment of lane alignments finished on `date +"%a %b %d %T %Z %Y"`" >> $dir/${file_header}_analysis_log.txt
+
+        #######################
+        # merging bam files
+        #######################
+
+        /usr/bin/java  -Xmx2048m -Xms256m -jar ${picard}/picard.jar MergeSamFiles \
+            INPUT=/$location/${sample}_lane_1_sorted.bam \
+            INPUT=$location/${sample}_lane_2_sorted.bam \
+            OUTPUT=$location/${file_header}_Aligned_Sorted.bam \
+            ASSUME_SORTED=true \
+            VALIDATION_STRINGENCY=SILENT
+
+        check_file $location/${file_header}_Aligned_Sorted.bam
+
+        echo "Merging lane alignments finished on `date +"%a %b %d %T %Z %Y"`" >> $dir/${file_header}_analysis_log.txt
+
+    fi
+
+    ${bamutil} clipOverlap \
+        --stats \
+        --in $location/${file_header}_Aligned_Sorted.bam \
+        --out $location/${file_header}_Aligned_Sorted_Clipped.bam \
+        &> $location/${file_header}_overlap_stats.txt
+
+    check_file $location/${file_header}_overlap_stats.txt
+
+    echo "$location/${file_header}_overlap_stats.txt" >> $dir/.tmp/to_copy
+
+
+    ########
+    # MAKE EXTENDED BED TO PREVENT EDGE EFFECTS - ALSO NICK B REQUESTED
+    ########
+
+    echo "filling bed"
+    regions=$location/restrict_to_these_regions.bed
+    ${python} $script_dir/fill_bed.py --bed $full_broad_panel_bed --out $regions
+
+    check_file ${regions}
+
+    echo $regions >> $dir/.tmp/to_copy
+
+    tot_reads=$(${samtools} view $location/${file_header}_Aligned_Sorted_Clipped.bam | wc -l)
+
+    failed=$(${samtools} view -f 512 $location/${file_header}_Aligned_Sorted_Clipped.bam | wc -l)
+
+    # merged output is already sorted provided supplied files were sorted
+
+    /usr/bin/java -Xmx2048m -Xms256m -jar ${picard}/picard.jar MarkDuplicates \
+     INPUT=$location/${file_header}_Aligned_Sorted_Clipped.bam \
+     OUTPUT=$location/${file_header}_Aligned_Sorted_Clipped_PCRDuped.bam \
+     ASSUME_SORTED=true \
+     METRICS_FILE=$location/duplicates_report.txt \
+     VALIDATION_STRINGENCY=SILENT
+
+    check_file $location/duplicates_report.txt
+
+    dup_info=$(grep -A 1 "UNPAIRED_READ_DUPLICATES" $location/duplicates_report.txt | tail -n 1)
+
+    unpaired_dups=$(echo $dup_info | cut -d ' ' -f5)
+    paired_dups=$(( 2 * $(echo $dup_info | cut -d ' ' -f6) )) # multiply by two because it is a pair
+    pcr_dups=$(( unpaired_dups + paired_dups ))
+    optical_dups=$(( 2 * $(echo $dup_info | cut -d ' ' -f7) )) # also multiplied by two
+    lib_size=$(echo $dup_info | cut -d ' ' -f9)
+
+    #file has to be indexed before GATK will use it
+    ${samtools} index $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped.bam
+
+
+     #TODO Why is this an older version of GATK for this step??? Have changed this to use normal gatk3.7
+    #java -jar /results/Pipeline/program/GenomeAnalysisTK-3.6/GenomeAnalysisTK.jar -T RealignerTargetCreator -R ${reference} -dt NONE -I $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped.bam -o $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_ForRealign.intervals -L $regions
+    java -Xmx2048m -Xms256m -jar ${gatk} -T RealignerTargetCreator -R ${reference} -dt NONE -I $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped.bam -o $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_ForRealign.intervals -L $regions
+    check_file $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_ForRealign.intervals
+
+    #java -jar /results/Pipeline/program/GenomeAnalysisTK-3.6/GenomeAnalysisTK.jar -T IndelRealigner -R ${reference} -I $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped.bam -targetIntervals $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_ForRealign.intervals -o $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam --filter_mismatching_base_and_quals -L $regions
+    java -Xmx2048m -Xms256m -jar ${gatk} -T IndelRealigner -R ${reference} -I $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped.bam -targetIntervals $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_ForRealign.intervals -o $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam --filter_mismatching_base_and_quals -L $regions
+
+    check_file $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam
+
+    ${samtools} index $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam
+
+    ${samtools} view -b -F 0x400 $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam > $location/${file_header}_QCTest_PCRDupesRemoved.bam
+
+    echo "Removing duplicates and realignment around indels on full BAM file finished on `date +"%a %b %d %T %Z %Y"`" >> $dir/${file_header}_analysis_log.txt
+
+    #############
+    # QC
+    #############
+    #this is too intensive for exome and not really required for now
+    if [ "${exome}" == "False" ]
+    then
+#        # makes file of forward reads that pass, are not duplicates, map, mate maps, are on forward strand and mate maps to reverse strand
+#        ${samtools} view -o $location/forward_reads.txt -f 32 -F 1564 $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped.bam
+#
+#        # makes file of reverse reads that pass, are not duplicates, map, mate maps, are on reverse strand and mate maps to forward strand
+#        ${samtools} view -o $location/reverse_reads.txt -f 16 -F 1580 $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped.bam
+#        # makes file of passed reads that are not duplicates
+#        ${samtools} view -o $location/passed_non_duplicate_reads.txt -F 1536 $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped.bam
+#
+#        # calls perl script to calculate statistics on read length, reads that map to same chromosome in correct orientation and insert size
+#        # output printed from perl is stored as a bash variable
+#        read_stats=$(perl /results/Pipeline/script/current/determining_read_and_insert_size.pl $location/forward_reads.txt $location/reverse_reads.txt $exp_ins $location/passed_non_duplicate_reads.txt)
+#
+#        perl_script=/results/Pipeline/script/current/determining_read_and_insert_size.pl
+#
+#        set -f # shell splits variable on IFS characters -f turns off globbing, which allow you to split a string on the IFS characters (default is whitespace) into an array
+#        read_info=($read_stats)
+#        read_length=${read_info[0]}
+#        read_first=${read_info[1]}
+#        read_third=${read_info[2]}
+#        n_correct_orient=${read_info[3]}
+#        median_insert=${read_info[4]}
+#        first_quart_insert=${read_info[5]}
+#        third_quart_insert=${read_info[6]}
+#        small_insert=${read_info[7]}
+#        large_insert=${read_info[8]}
+#        set +f
+
+
+        ${samtools} index $location/${file_header}_Aligned_Sorted_Clipped.bam
+
+        ${samtools} flagstat $location/${file_header}_Aligned_Sorted_Clipped.bam > $location/${file_header}_Alignment.txt
+
+        aligned_passed_reads=$(grep mapped $location/${file_header}_Alignment.txt | grep -v 'mate mapped' | cut -d ' ' -f1)
+
+        prop_paired=$(grep 'properly paired' $location/${file_header}_Alignment.txt | cut -d ' ' -f1)
+
+        no_off_target=$(${bedtools} intersect -v -bed -abam $location/${file_header}_Aligned_Sorted_Clipped.bam -b ${full_broad_panel_bed} | wc -l)
+
+        #/results/Pipeline/program/bedtools-2.17.0/bin/intersectBed -v -bed -abam $location/${file_header}_Aligned_Sorted_Clipped.bam -b ${full_broad_panel_bed} | wc -l > $location/${file_header}_ReadsOffTarget.txt
+        # -abam is bam file containing feature A, -bed means output as bed file -v only reports entries in A than don't overlap with B. Outputs each alignment that doesn't overlap with bed file (1bp overlap is all that is required) NB only the queried read and not its mate is checked.
+
+        #echo $location/${file_header}_ReadsOffTarget.txt >> $dir/.tmp/to_copy
+
+        #no_off_target=$(cat $location/${file_header}_ReadsOffTarget.txt)
+
+        no_on_target=$((tot_reads-no_off_target))
+
+        ${python} ${script_dir}/off_target_reads.py --outputprefix $location/${file_header} --total_reads ${tot_reads} --off_target ${no_off_target} --on_target ${no_on_target}
+        # get summary coverage information for broad panel
+        #java -jar $gatk -T DepthOfCoverage -R ${reference} -I $location/${file_header}_QCTest_PCRDupesRemoved.bam -L ${full_broad_panel_bed} -dt NONE -omitBaseOutput --omitIntervalStatistics --omitLocusTable --interval_set_rule UNION --interval_merging OVERLAPPING_ONLY --summaryCoverageThreshold 5 --summaryCoverageThreshold 10 --summaryCoverageThreshold 15 --summaryCoverageThreshold 20 --summaryCoverageThreshold 25 --summaryCoverageThreshold 30 --summaryCoverageThreshold 35 --summaryCoverageThreshold 40 --summaryCoverageThreshold 45 --summaryCoverageThreshold 50 --summaryCoverageThreshold 100 > $location/results_coverage.txt
+
+        #grep -A 1 -P "sample_id\ttotal\tmean\tgranular_third_quartile\tgranular_median\tgranular_first_quartile" /$location/results_coverage.txt > $location/broad_coverage.txt; rm $location/results_coverage.txt
+
+        #broad_coverage=$(sed -n '2p' $location/broad_coverage.txt | cut -f 7-17)
+
+        # get summary coverage information for small panel
+        #java -jar $gatk -T DepthOfCoverage -R ${reference} -I $location/${file_header}_QCTest_PCRDupesRemoved.bam -L ${full_small_panel_bed} -dt NONE -omitBaseOutput --interval_set_rule UNION --interval_merging OVERLAPPING_ONLY --summaryCoverageThreshold 5 --summaryCoverageThreshold 10 --summaryCoverageThreshold 15 --summaryCoverageThreshold 20 --summaryCoverageThreshold 25 --summaryCoverageThreshold 30 --summaryCoverageThreshold 35 --summaryCoverageThreshold 40 --summaryCoverageThreshold 45 --summaryCoverageThreshold 50 --summaryCoverageThreshold 100 > $location/tempcoverage.txt
+
+        #grep -A 1 -P "sample_id\ttotal\tmean\tgranular_third_quartile\tgranular_median\tgranular_first_quartile" $location/tempcoverage.txt > $location/${file_header}_${bed_abbrev}_MergedROICoverage.txt; rm $location/tempcoverage.txt
+        # grep -A 1 "text" means print line containing "text" and 1 line afterwards, -P means interpret pattern as a Perl regular expression
+
+        #coverage=$(sed -n '2p' $location/${file_header}_${bed_abbrev}_MergedROICoverage.txt | cut -f 7-17)
+        # sed commnand gets second line of file
+        # cut uses \t as delimiter by default and keeps results with same delimiter as input
+
+        #${bedtools} coverage -abam $location/${file_header}_QCTest_PCRDupesRemoved.bam -b ${full_small_panel_bed} -d > $location/tempperbasecoverage.txt
+
+        #perl /results/Pipeline/script/current/extracting_regions_with_below_minimum_depth.pl $location/tempperbasecoverage.txt $exon_bed $location/${file_header}_${bed_abbrev}_coverage_curve_${req_depth}X.txt $location/${file_header}_${bed_abbrev}_Alamut_coverage_curve_${req_depth}X.bed $req_depth $intron_depth
+
+       # cat $location/tempperbasecoverage.txt | fromdos -a | cut -d$'\t' -f6 | sort -n > /$location/depth_per_base.txt
+
+        #head -1 $location/depth_per_base.txt > $location/${file_header}_${bed_abbrev}_MinCoverage.txt
+
+        #min_depth=$(cat $location/${file_header}_${bed_abbrev}_MinCoverage.txt)
+
+        #tail -1 $location/depth_per_base.txt > $location/${file_header}_${bed_abbrev}_MaxCoverage.txt
+
+        #Copy files post Step 4: QC
+        # files relating to the small bed panel will be placed within a directory labelled with the BED file abbreviation
+        #cp $location/${file_header}_${bed_abbrev}_coverage_curve_${req_depth}X.txt $location/${file_header}_${bed_abbrev}_Alamut_coverage_curve_${req_depth}X.bed $location/${file_header}_${bed_abbrev}_MaxCoverage.txt $location/${file_header}_${bed_abbrev}_MergedROICoverage.txt $location/${file_header}_${bed_abbrev}_MinCoverage.txt $dir/$bed_abbrev
+
+        # copy files related to broad panel to patient directory
+        #cp $location/${file_header}_Alignment.txt $location/${file_header}_ReadsOffTarget.txt $dir/
+        cp $location/${file_header}_Alignment.txt $location/${file_header}_offtarget_reads.json $dir/
+    fi
+
+    ##################################################
+    #Analysis step 5:  Variant calling and annotation#
+    ##################################################
+
+    echo "QC finished on `date +"%a %b %d %T %Z %Y"`" >> $dir/${file_header}_analysis_log.txt
+
+    java -Xmx2048m -Xms256m -jar ${gatk} -T HaplotypeCaller -R ${reference} -dt NONE -I $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam -stand_call_conf 30 --output_mode EMIT_VARIANTS_ONLY -maxAltAlleles 10 -o $location/${file_header}_Variants_undecomposed.vcf -L $regions --bamOutput ${dir}/${file_header}_GATK_haplotype.bam
+
+    check_file $location/${file_header}_Variants_undecomposed.vcf
+
+    ${vt} decompose -s $location/${file_header}_Variants_undecomposed.vcf -o $location/${file_header}_Variants_decomposed.vcf
+
+    ${vt} normalize -r $reference $location/${file_header}_Variants_decomposed.vcf -o $location/${file_header}_Variants.vcf
+
+    echo "Variant calling finished on `date +"%a %b %d %T %Z %Y"`" >> $dir/${file_header}_analysis_log.txt
+
+    ${bedtools} intersect -a $location/${file_header}_Variants.vcf -b $full_broad_panel_bed -header > $dir/.tmp/restricted_Variants.vcf
+
+
+    ${python} ${script_dir}/get_af.py -s ${sample} -fh ${file_header} -v ${dir}/.tmp/restricted_Variants.vcf -o ${dir} -d ${script_dir} -c /sdgs/software/pipeline/SDGSPipeline/resources/control_allele_frequencies.txt
+
+    echo "$location/${file_header}_AF_plot.pdf" >> $dir/.tmp/to_copy
+
+    ###VERIFY BAM ID
+    vcf=`echo $broad_bed | cut -f1 -d"_"`
+    ${verifyBamId} --bam $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam --out $dir/${file_header}_verify --vcf /sdgs/reference/gnomad/gnomAD.r2.1.1.${vcf}_final.vcf.gz
+    echo "gnomad,/sdgs/reference/gnomad/gnomAD.r2.1.1.${vcf}_final.vcf.gz" >> $dir/.tmp/${file_header}_provenance.txt
+    freemix=`cat $dir/${file_header}_verify.selfSM | cut -f7 | grep -v FREEMIX | awk '{ print $1*100}'`
+    echo -e "sample\tcontamination_percent" >  ${dir}/${file_header}_contamination.txt
+    echo -e "${sample}\t${freemix}" >>  ${dir}/${file_header}_contamination.txt
+
+    ###########################################################################
+    ######Addition to recalculate PKD1 contamination values minus ex1-33######
+    ###########################################################################
+    if [ ${vcf} == 'HeredCancerCystic' ]
+    then
+        ${verifyBamId} --bam $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam --out $dir/${file_header}_recalculated_verify --vcf /sdgs/reference/gnomad/gnomAD.r2.1.1.HeredCancerCystic_NoPKD1ex1-33.vcf_final.vcf.gz
+        echo "gnomad_contamination_recalculation,gnomAD.r2.1.1.HeredCancerCystic_NoPKD1ex1-33.vcf_final.vcf.gz" >> $dir/.tmp/${file_header}_provenance.txt
+        freemix=`cat $dir/${file_header}_recalculated_verify.selfSM | cut -f7 | grep -v FREEMIX | awk '{ print $1*100}'`
+        echo -e "sample\tcontamination_percent" >  ${dir}/${file_header}_contamination_recalculated_pkd1.txt
+        echo -e "${sample}\t${freemix}" >>  ${dir}/${file_header}_contamination_recalculated_pkd1.txt
+    fi
+
+fi
+
+#For reanalysis backwards compatibility with versions before 3.4.0 - check if HeredCancerCystic recalculated contamination exists, if not create it
+if [ ${rescoping} == "True" ]
+then
+    vcf=`echo $broad_bed | cut -f1 -d"_"`
+    if [ ${vcf} == 'HeredCancerCystic' ]
+    then
+        if [[ ! -f $dir/${file_header}_recalculated_verify.selfSM ]]
+        then
+            echo "Recalcuted verifybamid does not exist, creating it now"
+            ${verifyBamId} --bam $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam --out $dir/${file_header}_recalculated_verify --vcf /sdgs/reference/gnomad/gnomAD.r2.1.1.HeredCancerCystic_NoPKD1ex1-33.vcf_final.vcf.gz
+            echo "gnomad_contamination_recalculation,gnomAD.r2.1.1.HeredCancerCystic_NoPKD1ex1-33.vcf_final.vcf.gz" >> $dir/.tmp/${file_header}_provenance.txt
+            freemix=`cat $dir/${file_header}_recalculated_verify.selfSM | cut -f7 | grep -v FREEMIX | awk '{ print $1*100}'`
+            echo -e "sample\tcontamination_percent" >  ${dir}/${file_header}_contamination_recalculated_pkd1.txt
+            echo -e "${sample}\t${freemix}" >>  ${dir}/${file_header}_contamination_recalculated_pkd1.txt
+        fi
+    fi
+
+fi
+
+#####BACKWARDS COMPATIBILITY WITH v3.1
+
+if [ ! -f $location/${file_header}_Variants.vcf ]
+then
+
+ln -s $location/${file_header}_with_downsampling.vcf $location/${file_header}_Variants.vcf
+
+fi
+
+if [ ! -f $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam ]
+then
+
+ln -s $location/${file_header}_Aligned_Clipped_Sorted_PCRDuped_IndelsRealigned.bam $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam
+ln -s $location/${file_header}_Aligned_Clipped_Sorted_PCRDuped_IndelsRealigned.bai $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bai
+
+fi
+
+####
+
+ # Filter the merged VCF by BED file.
+echo "filtering vcf"
+/usr/local/bin/vcftools --vcf $location/${file_header}_Variants.vcf --bed ${full_small_panel_bed} --out $dir/.tmp/${file_header}_${bed_abbrev} --recode --recode-INFO-all
+
+check_file ${dir}/.tmp/${file_header}_${bed_abbrev}.recode.vcf
+
+## backwards compatibility with v3.2.X ##
+if [ ${rescoping} == "True" ]
+then
+    ${vt} decompose -s -o ${dir}/.tmp/${file_header}_${bed_abbrev}_decomposed.vcf ${dir}/.tmp/${file_header}_${bed_abbrev}.recode.vcf
+
+    ${vt} normalize -r $reference -o ${dir}/.tmp/${file_header}_${bed_abbrev}_decomposed_normalised.vcf ${dir}/.tmp/${file_header}_${bed_abbrev}_decomposed.vcf
+
+    mv ${dir}/.tmp/${file_header}_${bed_abbrev}.recode.vcf ${dir}/.tmp/${file_header}_${bed_abbrev}.recode_undecomposed.vcf
+    mv ${dir}/.tmp/${file_header}_${bed_abbrev}_decomposed_normalised.vcf ${dir}/.tmp/${file_header}_${bed_abbrev}.recode.vcf
+fi
+
+#check there are variants in the vcf
+
+variant_count=`cat $dir/.tmp/${file_header}_${bed_abbrev}.recode.vcf | grep -v "\#" | wc -l`
+
+if [ "${variant_count}" == "0" ]
+then
+    cp $dir/.tmp/${file_header}_${bed_abbrev}.recode.vcf $dir/.tmp/${file_header}_${bed_abbrev}_dbSNP_COSMIC.vcf
+    cp $dir/.tmp/${file_header}_${bed_abbrev}.recode.vcf $dir/.tmp/${file_header}_${bed_abbrev}_dbSNP_COSMIC_CLINVAR_GNOMAD.vcf
+    cp $dir/.tmp/${file_header}_${bed_abbrev}.recode.vcf $dir/.tmp/${file_header}_${bed_abbrev}_dbSNP_COSMIC_CLINVAR_GNOMAD_CADD_REVEL.vcf
+
+else
+
+    echo "snp sift"
+    # Variant annotation from dbSNP, COSMIC and HGVS.
+    /usr/bin/java -Xmx2048m -Xms256m -jar $snpeff annotate -id ${dbsnp} $dir/.tmp/${file_header}_${bed_abbrev}.recode.vcf > $dir/.tmp/${file_header}_${bed_abbrev}_dbSNP.vcf
+
+    check_file $dir/.tmp/${file_header}_${bed_abbrev}_dbSNP.vcf
+
+    /usr/bin/java -Xmx2048m -Xms256m -jar $snpeff annotate -id ${cosmic} $dir/.tmp/${file_header}_${bed_abbrev}_dbSNP.vcf > $dir/.tmp/${file_header}_${bed_abbrev}_dbSNP_COSMIC.vcf
+
+    cp $vcfanno_config $dir/.tmp/vcfanno_config.toml
+    ##ensure reanalysis also gets vcf variable assigned
+    vcf=`echo $broad_bed | cut -f1 -d"_"`
+    sed -i "2 i file=\"/sdgs/reference/gnomad/gnomAD.r2.1.1.${vcf}_final.vcf.gz\"" $dir/.tmp/vcfanno_config.toml
+    $vcfanno $dir/.tmp/vcfanno_config.toml $dir/.tmp/${file_header}_${bed_abbrev}_dbSNP_COSMIC.vcf > $dir/.tmp/${file_header}_${bed_abbrev}_dbSNP_COSMIC_CLINVAR_GNOMAD.vcf
+
+    ${python} ${script_dir}/meta-predictor_annotation.py \
+    --vcf $dir/.tmp/${file_header}_${bed_abbrev}_dbSNP_COSMIC_CLINVAR_GNOMAD.vcf \
+    --revel /sdgs/reference/meta_predictor_scores/${vcf}_revel_scores.bed \
+    --cadd /sdgs/reference/meta_predictor_scores/${vcf}_cadd_scores.bed \
+    --vcf_out $dir/.tmp/${file_header}_${bed_abbrev}_dbSNP_COSMIC_CLINVAR_GNOMAD_CADD_REVEL.vcf \
+    --bedtools ${bedtools}
+
+fi
+
+check_file $dir/.tmp/${file_header}_${bed_abbrev}_dbSNP_COSMIC.vcf
+check_file $dir/.tmp/${file_header}_${bed_abbrev}_dbSNP_COSMIC_CLINVAR_GNOMAD.vcf
+check_file $dir/.tmp/${file_header}_${bed_abbrev}_dbSNP_COSMIC_CLINVAR_GNOMAD_CADD_REVEL.vcf
+echo $dir/.tmp/${file_header}_${bed_abbrev}_dbSNP_COSMIC_CLINVAR_GNOMAD.vcf >> $dir/.tmp/to_copy
+echo $dir/.tmp/${file_header}_${bed_abbrev}_dbSNP_COSMIC.vcf >> $dir/.tmp/to_copy
+echo $dir/.tmp/${file_header}_${bed_abbrev}_dbSNP_COSMIC_CLINVAR_GNOMAD_CADD_REVEL.vcf >> $dir/.tmp/to_copy
+
+echo "REVEL file,  /sdgs/reference/meta_predictor_scores/${vcf}_revel_scores.bed" >> $dir/.tmp/${file_header}_provenance.txt
+
+
+echo "filtering polys and low quality"
+grep -w -v -e "LowQual" $dir/.tmp/${file_header}_${bed_abbrev}_dbSNP_COSMIC_CLINVAR_GNOMAD_CADD_REVEL.vcf >> $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQs.vcf
+check_file $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQs.vcf
+echo $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQs.vcf >> $dir/.tmp/to_copy
+
+zipped_polylist=${poly_list}.gz
+env LD_PRELOAD=/usr/lib/libcurl.so.3 bgzip $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQs.vcf
+env LD_PRELOAD=/usr/lib/libcurl.so.3 tabix $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQs.vcf.gz
+${bcftools} isec -p $dir/.tmp $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQs.vcf.gz ${zipped_polylist}
+gunzip $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQs.vcf.gz
+check_file $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQs.vcf
+check_file $dir/.tmp/0000.vcf
+mv $dir/.tmp/0000.vcf $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQsPolys.vcf
+check_file $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQsPolys.vcf
+echo $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQsPolys.vcf >> $dir/.tmp/to_copy
+
+
+echo "prep"
+# prepare vcf for annovar by splitting any cases with more than one alt into separate lines for each alt and using annovar convention for indels. Save vcf representation for each allele as well as original vcf representation to match vcf data back up with annovar consequences
+/usr/bin/perl $script_dir/$perl_4 $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQsPolys.vcf $dir/.tmp/annovar_vcf.txt $dir/.tmp/${file_header}_${bed_abbrev}_logfile_preparing_vcf.txt
+
+echo "anovar"
+# get annovar annotation in three different ways
+bash $script_dir/$bash_1 $dir/.tmp annovar_vcf.txt $annovar_path
+
+# combine annovar annotation with vcf metrics
+perl $script_dir/$perl_5 $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQsPolys.vcf $dir/.tmp/all_vars.exonic_variant_function $dir/.tmp/most_severe.variant_function $dir/.tmp/all_vars_transcripts.variant_function $dir/.tmp/all_vars.variant_function $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQsPolys.txt $dir/.tmp/${file_header}_${bed_abbrev}_logfile_preparing_vcf.txt $full_trans_file
+
+## remove low quality calls and polymorphisms
+#echo "#SDGS Pipeline ${version}" > $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQs.txt
+#grep -w -v -e "LowQual" $dir/.tmp/${file_header}_${bed_abbrev}_variants.txt >> $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQs.txt
+#
+#check_file $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQs.txt
+#
+#grep -w -v -f ${poly_list} $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQs.txt > $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQsPolys.txt
+#
+echo $version
+sed -i "1 i #SDGS Pipeline $version" $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQsPolys.txt
+#echo 'sed -i "1s/^/SDGS Pipeline ${version}\n/" $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQsPolys.txt'
+check_file $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQsPolys.txt
+
+
+########################
+# MATT ADDITIONS
+########################
+
+#you have to remove the header line from the bed
+bed_actual=`basename ${full_small_panel_bed}`
+grep -i -v start ${full_small_panel_bed} > $dir/.tmp/${bed_actual}.temp.bed
+exonic_bed_actual=`basename $exon_bed`
+grep -i -v start ${exon_bed} > $dir/.tmp/${exonic_bed_actual}.temp.bed
+
+# Generate coverage with sambamba (replaces bedtools part)
+${sambamba} depth region \
+    --cov-threshold=0 \
+    --cov-threshold=10 \
+    --cov-threshold=20 \
+    --cov-threshold=30 \
+    --cov-threshold=40 \
+    --cov-threshold=50 \
+    -q29 \
+    -m \
+    -L $dir/.tmp/${bed_actual}.temp.bed \
+    $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam \
+    > $dir/.tmp/${file_header}_coverage_depth_regions_full_small_panel.txt
+
+check_file $dir/.tmp/${file_header}_coverage_depth_regions_full_small_panel.txt
+
+echo "$dir/.tmp/${file_header}_coverage_depth_regions_full_small_panel.txt" >> $dir/.tmp/to_copy
+
+${sambamba} depth base \
+    --min-coverage=0 \
+    -q29 \
+    -m \
+    -L $dir/.tmp/${bed_actual}.temp.bed \
+    $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam \
+    > $dir/.tmp/${file_header}_coverage_depth_bases_full_small_panel.txt.tmp
+
+check_file $dir/.tmp/${file_header}_coverage_depth_bases_full_small_panel.txt.tmp
+
+#fix problem with sambamba - basically find regions that are missing from bases file then fill them in with 0's
+
+awk '{print($1"\t"$2"\t"$2+1"\t"$3)}' $dir/.tmp/${file_header}_coverage_depth_bases_full_small_panel.txt.tmp | grep -v "COV" > $dir/.tmp/${file_header}_coverage_depth_bases_full_small_panel.bed.tmp
+
+${bedtools} intersect -v -a $dir/.tmp/${bed_actual}.temp.bed -b $dir/.tmp/${file_header}_coverage_depth_bases_full_small_panel.bed.tmp > $dir/.tmp/regions_missing
+
+while read i; do start=`echo "$i"|cut -f2`; end=`echo "$i"|cut -f3`; chr=`echo "$i"|cut -f1`; end_true=`echo "${end} - 1" | bc`; for j in $(seq $start $end_true);do new_end=`echo -e "${j} + 1" | bc`; echo -e "$chr\t${j}\t0\t0\t0\t0\t0\t0\t0\t${sample}" ;done ;done < $dir/.tmp/regions_missing > $dir/.tmp/to_add
+
+cat $dir/.tmp/${file_header}_coverage_depth_bases_full_small_panel.txt.tmp $dir/.tmp/to_add > $dir/.tmp/${file_header}_coverage_depth_bases_full_small_panel.txt
+
+awk '{print($1"\t"$2"\t"$2+1"\t"$3)}' $dir/.tmp/${file_header}_coverage_depth_bases_full_small_panel.txt > $dir/.tmp/${file_header}_coverage_depth_bases_full_small_panel.bed
+
+echo "$dir/.tmp/${file_header}_coverage_depth_bases_full_small_panel.txt" >> $dir/.tmp/to_copy
+echo "$dir/.tmp/${file_header}_coverage_depth_bases_full_small_panel.bed" >> $dir/.tmp/to_copy
+
+#################
+
+# Generate coverage with sambamba (replaces bedtools part)
+${sambamba} depth region \
+    --cov-threshold=0 \
+    --cov-threshold=10 \
+    --cov-threshold=20 \
+    --cov-threshold=30 \
+    --cov-threshold=40 \
+    --cov-threshold=50 \
+    -m \
+    -q29 \
+    -L $dir/.tmp/${exonic_bed_actual}.temp.bed \
+    $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam \
+    > $dir/.tmp/${file_header}_coverage_depth_regions_exonic.txt
+
+check_file $dir/.tmp/${file_header}_coverage_depth_regions_exonic.txt
+
+echo "$dir/.tmp/${file_header}_coverage_depth_regions_exonic.txt" >> $dir/.tmp/to_copy
+
+${sambamba} depth base \
+    --min-coverage=0 \
+    -m \
+    -q29 \
+    -L $dir/.tmp/${exonic_bed_actual}.temp.bed \
+    $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam \
+    > $dir/.tmp/${file_header}_coverage_depth_bases_exonic.txt.tmp
+
+check_file $dir/.tmp/${file_header}_coverage_depth_bases_exonic.txt.tmp
+
+#fix problem with sambamba - basically find regions that are missing from bases file then fill them in with 0's
+
+awk '{print($1"\t"$2"\t"$2+1"\t"$3)}' $dir/.tmp/${file_header}_coverage_depth_bases_exonic.txt.tmp | grep -v "COV" > $dir/.tmp/${file_header}_coverage_depth_bases_exonic.bed.tmp
+
+${bedtools} intersect -v -a $dir/.tmp/${exonic_bed_actual}.temp.bed -b $dir/.tmp/${file_header}_coverage_depth_bases_exonic.bed.tmp > $dir/.tmp/regions_missing
+
+while read i; do start=`echo "$i"|cut -f2`; end=`echo "$i"|cut -f3`; chr=`echo "$i"|cut -f1`; end_true=`echo "${end} - 1" | bc`; for j in $(seq $start $end_true);do new_end=`echo -e "${j} + 1" | bc`; echo -e "$chr\t${j}\t0\t0\t0\t0\t0\t0\t0\t${sample}" ;done ;done < $dir/.tmp/regions_missing > $dir/.tmp/to_add
+
+cat $dir/.tmp/${file_header}_coverage_depth_bases_exonic.txt.tmp $dir/.tmp/to_add > $dir/.tmp/${file_header}_coverage_depth_bases_exonic.txt
+
+awk 'NR==1 {print $0} NR>1 {print($1"\t"$2"\t"$2+1"\t"$3)}' $dir/.tmp/${file_header}_coverage_depth_bases_exonic.txt > $dir/.tmp/${file_header}_coverage_depth_bases_exonic.bed
+
+##################
+
+#get the file that they use in alamut to show gaps that need filling
+awk '{if($3 < 30) print $1"\t"$2"\t"$2+1"\t"$3}' $dir/.tmp/${file_header}_coverage_depth_bases_exonic.txt  > $dir/.tmp/${worklist}-${sample}_bases_below_30x_exonic.bed
+
+#echo "$dir/.tmp/${file_header}_coverage_depth_bases_exonic.txt" >> $dir/.tmp/to_copy
+#echo "$dir/.tmp/${worklist}-${sample}_bases_below_30x_exonic.bed" >> $dir/.tmp/to_copy
+
+#intersect beds
+
+${bedtools} subtract -b $dir/.tmp/${exonic_bed_actual}.temp.bed -a $dir/.tmp/${bed_actual}.temp.bed > $dir/.tmp/intronic.bed
+
+# Generate coverage with sambamba (replaces bedtools part)
+${sambamba} depth region \
+    --cov-threshold=0 \
+    --cov-threshold=10 \
+    --cov-threshold=20 \
+    --cov-threshold=30 \
+    --cov-threshold=40 \
+    --cov-threshold=50 \
+    -m \
+    -q29 \
+    -L $dir/.tmp/intronic.bed \
+    $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam \
+    > $dir/.tmp/${file_header}_coverage_depth_regions_intronic.txt
+
+check_file $dir/.tmp/${file_header}_coverage_depth_regions_intronic.txt
+
+#echo "$dir/.tmp/${file_header}_coverage_depth_regions_intronic.txt" >> $dir/.tmp/to_copy
+
+${sambamba} depth base \
+    --min-coverage=0 \
+    -m \
+    -q29 \
+    -L $dir/.tmp/intronic.bed \
+    $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam \
+    > $dir/.tmp/${file_header}_coverage_depth_bases_intronic.txt.tmp
+
+check_file $dir/.tmp/${file_header}_coverage_depth_bases_intronic.txt.tmp
+
+#fix problem with sambamba - basically find regions that are missing from bases file then fill them in with 0's
+
+awk '{print($1"\t"$2"\t"$2+1"\t"$3)}' $dir/.tmp/${file_header}_coverage_depth_bases_intronic.txt.tmp | grep -v "COV" > $dir/.tmp/${file_header}_coverage_depth_bases_intronic.bed.tmp
+
+${bedtools} intersect -v -a $dir/.tmp/intronic.bed -b $dir/.tmp/${file_header}_coverage_depth_bases_intronic.bed.tmp > $dir/.tmp/regions_missing
+
+while read i; do start=`echo "$i"|cut -f2`; end=`echo "$i"|cut -f3`; chr=`echo "$i"|cut -f1`; end_true=`echo "${end} - 1" | bc`; for j in $(seq $start $end_true);do new_end=`echo -e "${j} + 1" | bc`; echo -e "$chr\t${j}\t0\t0\t0\t0\t0\t0\t0\t${sample}" ;done ;done < $dir/.tmp/regions_missing > $dir/.tmp/to_add
+
+cat $dir/.tmp/${file_header}_coverage_depth_bases_intronic.txt.tmp $dir/.tmp/to_add > $dir/.tmp/${file_header}_coverage_depth_bases_intronic.txt
+
+awk 'NR==1 {print $0} NR>1 {print($1"\t"$2"\t"$2+1"\t"$3)}' $dir/.tmp/${file_header}_coverage_depth_bases_intronic.txt > $dir/.tmp/${file_header}_coverage_depth_bases_intronic.bed
+
+#################
+
+awk '{if($3 < 18) print $1"\t"$2"\t"$2+1"\t"$3}' $dir/.tmp/${file_header}_coverage_depth_bases_intronic.txt  > $dir/.tmp/${worklist}-${sample}_bases_below_18x_intronic.bed
+
+cat $dir/.tmp/${worklist}-${sample}_bases_below_30x_exonic.bed $dir/.tmp/${worklist}-${sample}_bases_below_18x_intronic.bed | ${bedtools} sort -i - > $dir/.tmp/${worklist}-${sample}_bases_not_covered.bed
+
+bases_count=`wc -l $dir/.tmp/${worklist}-${sample}_bases_not_covered.bed | cut -f1 -d" "`
+
+if [ "$bases_count" == "0" ]
+then
+
+echo -e "chromosome\tbp_pos\tregion\tdepth" > $dir/.tmp/${worklist}-${sample}_${bed_abbrev}_gaps_in_sequencing.txt
+
+else
+
+
+${bedtools} intersect -wb -a $dir/.tmp/${bed_actual}.temp.bed -b $dir/.tmp/${worklist}-${sample}_bases_not_covered.bed | cut -f1,2,4,8 | awk 'BEGIN{print "chromosome\tbp_pos\tregion\tdepth"}1' > $dir/.tmp/${worklist}-${sample}_${bed_abbrev}_gaps_in_sequencing.txt
+awk  'NR==1 {print $0} NR>1 {print $1"\t"$2+1"\t"$3"\t"$4}' $dir/.tmp/${worklist}-${sample}_${bed_abbrev}_gaps_in_sequencing.txt > $dir/.tmp/${worklist}-${sample}_${bed_abbrev}_gaps_in_sequencing_alamut.txt
+
+check_file $dir/.tmp/${worklist}-${sample}_${bed_abbrev}_gaps_in_sequencing_alamut.txt
+
+fi
+
+#######################################################################################################
+#### Lizzy's additions - calculate min coverage for exonic and intronic regions separately ###
+############################################################
+
+if [ "${rescoping}" == "True" ]
+then
+    minCoverageExonic=`sed '1d' $location/.tmp/${file_header}_coverage_depth_bases_exonic.bed | fromdos -a | cut -d$'\t' -f4 | sort -n | head -1`
+    minCoverageIntronic=`sed '1d' $location/.tmp/${file_header}_coverage_depth_bases_intronic.bed | fromdos -a | cut -d$'\t' -f4 | sort -n | head -1`
+else
+    minCoverageExonic=`sed '1d' $location/${file_header}_coverage_depth_bases_exonic.bed | fromdos -a | cut -d$'\t' -f4 | sort -n | head -1`
+    minCoverageIntronic=`sed '1d' $location/${file_header}_coverage_depth_bases_intronic.bed | fromdos -a | cut -d$'\t' -f4 | sort -n | head -1`
+fi
+
+######################################################################################################
+
+
+#######################################################################################################
+####         Christine's additions - added Lizzy's sex check script into main pipeline              ###
+#######################################################################################################
+
+${python} $script_dir/sex_check.py \
+    --output ${dir} \
+    --file_header ${file_header} \
+    --sample ${sample} \
+    --vcf $location/${file_header}_Variants.vcf \
+    --bam $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped.bam \
+    --broad_bed ${broad_bed}
+
+check_file ${dir}/${file_header}_sex_check.json
+
+
+# Get total reads and off-target reads for reanalysis samples
+if [ "${rescoping}" == "True" ]
+then
+    if [ -f $dir/${file_header}_offtarget_reads.json ]
+    then
+        # tot_reads=`cat $location/${file_header}_TotalReads.txt` ## refactor to json
+        tot_reads=`cat $dir/${file_header}_offtarget_reads.json | python -c "import json,sys;obj=json.load(sys.stdin);print obj['total_reads'];"`
+        no_off_target=`cat $dir/${file_header}_offtarget_reads.json | python -c "import json,sys;obj=json.load(sys.stdin);print obj['off_target_reads'];"`
+    else
+        tot_reads=$(${samtools} view $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped.bam | wc -l)
+        no_off_target=`/results/Pipeline/program/bedtools-2.17.0/bin/intersectBed -v -bed -abam $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped.bam -b ${full_broad_panel_bed} | wc -l`
+        no_on_target=$((tot_reads-no_off_target))
+
+        ${python} ${script_dir}/off_target_reads.py --outputprefix $location/${file_header} --total_reads ${tot_reads} --off_target ${no_off_target} --on_target ${no_on_target}
+    fi
+fi
+
+######################################################################################################
+
+
+#echo "$dir/.tmp/${file_header}_coverage_depth_bases_intronic.bed" >> $dir/.tmp/to_copy
+#echo "$dir/.tmp/${file_header}_coverage_depth_bases_intronic.txt" >> $dir/.tmp/to_copy
+echo "$dir/.tmp/${worklist}-${sample}_${bed_abbrev}_gaps_in_sequencing.txt" >> $dir/.tmp/to_copy
+echo "$dir/.tmp/${worklist}-${sample}_${bed_abbrev}_gaps_in_sequencing_alamut.txt" >> $dir/.tmp/to_copy
+
+echo "samtools stats"
+# Generate samtools stats
+${samtools} stats \
+    -d \
+    --ref-seq ${reference} \
+    $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped.bam \
+    > $dir/.tmp/${file_header}_samtools_stats_rmdup.txt
+
+check_file $dir/.tmp/${file_header}_samtools_stats_rmdup.txt
+
+#echo "$dir/.tmp/${file_header}_samtools_stats_rmdup.txt" >> $dir/.tmp/to_copy
+
+${samtools} stats \
+    --ref-seq ${reference} \
+    $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped.bam \
+    > $dir/.tmp/${file_header}_samtools_stats_all.txt
+
+check_file $dir/.tmp/${file_header}_samtools_stats_all.txt
+
+#echo "$dir/.tmp/${file_header}_samtools_stats_all.txt" >> $dir/.tmp/to_copy
+
+if [ ${vcf} == 'HeredCancerCystic' ] ### use the contamination value without PKD1 exon1-33 recalculated value
+then
+    ${python} $script_dir/hiseq_helper.py \
+     --coverage $dir/.tmp/${file_header}_coverage_depth_bases_full_small_panel.txt \
+     --stats $dir/.tmp/${file_header}_samtools_stats_all.txt \
+     --stats_rmdup $dir/.tmp/${file_header}_samtools_stats_rmdup.txt \
+     --outputprefix $dir/.tmp/${file_header}_${bed_abbrev} \
+     --contamination $dir/${file_header}_recalculated_verify.selfSM \
+     --fastqc_dir $dir/fastqc/ \
+     --sample ${worklist}-${sample} \
+     --vcf $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQsPolys.vcf \
+     --service ${group} \
+     --bed_abbrev ${bed_abbrev}
+
+else
+    ${python} $script_dir/hiseq_helper.py \
+     --coverage $dir/.tmp/${file_header}_coverage_depth_bases_full_small_panel.txt \
+     --stats $dir/.tmp/${file_header}_samtools_stats_all.txt \
+     --stats_rmdup $dir/.tmp/${file_header}_samtools_stats_rmdup.txt \
+     --outputprefix $dir/.tmp/${file_header}_${bed_abbrev} \
+     --contamination $dir/${file_header}_verify.selfSM \
+     --fastqc_dir $dir/fastqc/ \
+     --sample ${worklist}-${sample} \
+     --vcf $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQsPolys.vcf \
+     --service ${group} \
+     --bed_abbrev ${bed_abbrev}
+fi
+
+echo "${python} $script_dir/hiseq_helper.py \
+ --coverage $dir/.tmp/${file_header}_coverage_depth_bases_full_small_panel.txt \
+ --stats $dir/.tmp/${file_header}_samtools_stats_all.txt \
+ --stats_rmdup $dir/.tmp/${file_header}_samtools_stats_rmdup.txt \
+ --outputprefix $dir/.tmp/${file_header}_${bed_abbrev} \
+ --contamination $dir/${file_header}_verify.selfSM \
+ --fastqc_dir $dir/fastqc/ \
+ --sample ${worklist}-${sample} \
+ --vcf $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQsPolys.vcf \
+ --service ${group} \
+ --bed_abbrev ${bed_abbrev}"
+
+#check_file $dir/.tmp/${file_header}_samtools_stats_all.txt
+#check_file $dir/.tmp/${file_header}_samtools_stats_rmdup.txt
+check_file $dir/.tmp/${file_header}_${bed_abbrev}_coverage_summary.txt
+check_file $dir/.tmp/${file_header}_${bed_abbrev}_samtools_stats_all.json
+check_file $dir/.tmp/${file_header}_${bed_abbrev}_samtools_stats_rmdup.json
+check_file $dir/.tmp/${file_header}_${bed_abbrev}_median_insert.json
+check_file $dir/.tmp/${file_header}_${bed_abbrev}_contamination.json
+
+#echo "$dir/.tmp/${file_header}_samtools_stats_rmdup.txt" >> $dir/.tmp/to_copy
+echo "$dir/.tmp/${file_header}_${bed_abbrev}_coverage_summary.txt" >> $dir/.tmp/to_copy
+echo "$dir/.tmp/${file_header}_${bed_abbrev}_samtools_stats_all.json" >> $dir/.tmp/to_copy
+echo "$dir/.tmp/${file_header}_${bed_abbrev}_samtools_stats_rmdup.json" >> $dir/.tmp/to_copy
+echo "$dir/.tmp/${file_header}_${bed_abbrev}_median_insert.json" >> $dir/.tmp/to_copy
+echo "$dir/.tmp/${file_header}_${bed_abbrev}_contamination.json" >> $dir/.tmp/to_copy
+
+
+
+#########################
+# END MATT ADDITIONS
+##########################
+
+max_depth=`cat $dir/.tmp/${file_header}_${bed_abbrev}_coverage_summary.txt | python -c "import json,sys;obj=json.load(sys.stdin);print obj['max'];"`
+min_depth=`cat $dir/.tmp/${file_header}_${bed_abbrev}_coverage_summary.txt | python -c "import json,sys;obj=json.load(sys.stdin);print obj['min'];"`
+percentage0=`cat $dir/.tmp/${file_header}_${bed_abbrev}_coverage_summary.txt | python -c "import json,sys;obj=json.load(sys.stdin);print obj['percentage0'];"`
+percentage5=`cat $dir/.tmp/${file_header}_${bed_abbrev}_coverage_summary.txt | python -c "import json,sys;obj=json.load(sys.stdin);print obj['percentage5'];"`
+percentage10=`cat $dir/.tmp/${file_header}_${bed_abbrev}_coverage_summary.txt | python -c "import json,sys;obj=json.load(sys.stdin);print obj['percentage10'];"`
+percentage20=`cat $dir/.tmp/${file_header}_${bed_abbrev}_coverage_summary.txt | python -c "import json,sys;obj=json.load(sys.stdin);print obj['percentage20'];"`
+percentage30=`cat $dir/.tmp/${file_header}_${bed_abbrev}_coverage_summary.txt | python -c "import json,sys;obj=json.load(sys.stdin);print obj['percentage30'];"`
+percentage50=`cat $dir/.tmp/${file_header}_${bed_abbrev}_coverage_summary.txt | python -c "import json,sys;obj=json.load(sys.stdin);print obj['percentage50'];"`
+percentage100=`cat $dir/.tmp/${file_header}_${bed_abbrev}_coverage_summary.txt | python -c "import json,sys;obj=json.load(sys.stdin);print obj['percentage100'];"`
+
+coverage=`echo -e "${percentage0}\t${percentage5}\t${percentage10}\t${percentage20}\t${percentage30}\t${percentage50}\t${percentage100}"`
+
+if [ "${rescoping}" == "False" ]
+then
+    echo -e "$run_no\t$worklist\t$group\t$sample\t$tot_reads\t$failed\t$pcr_dups\t$optical_dups\t$lib_size\t$read_length\t$read_first\t$read_third\t$aligned_passed_reads\t$prop_paired\t$n_correct_orient\t$median_insert\t$first_quart_insert\t$third_quart_insert\t$small_insert\t$large_insert\t$broad_bed\t$no_on_target\t$broad_coverage\t$small_bed\t$max_depth\t$min_depth\t$coverage" > $dir/temp_run_report.txt
+fi
+
+####################################################
+#Post-analysis step:  Copying files and tidying up #
+####################################################
+
+
+echo "Annotation finished on `date +"%a %b %d %T %Z %Y"`" >> $dir/${file_header}_analysis_log.txt
+
+#Copy files post Step 4: QC
+# Those relating to small panel stored in bed_abbrev directory
+#cp $dir/.tmp/${file_header}_${bed_abbrev}_variants.txt $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQs.txt $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQsPolys.txt $dir/.tmp/${file_header}_${bed_abbrev}_logfile_preparing_vcf.txt $dir/$bed_abbrev/
+cp $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQs.vcf $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQsPolys.vcf $dir/.tmp/${file_header}_${bed_abbrev}_variants_LessLQsPolys.txt $dir/.tmp/${file_header}_${bed_abbrev}_logfile_preparing_vcf.txt $dir/$bed_abbrev/
+
+
+if [ "${rescoping}" == "False" ]
+then
+    cp $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped.bam \
+     $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped.bam.bai \
+     $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam \
+     $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bai \
+     $location/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam.bai \
+     $location/${file_header}_Variants.vcf \
+     $location/${file_header}_overlap_stats.txt $dir/
+fi
+
+while read i;
+do
+cp ${i} $dir/$bed_abbrev/
+done < $dir/.tmp/to_copy
+#cp $dir/$bed_abbrev/${file_header}_${bed_abbrev}_Alamut_coverage_curve_30X.bed $dir/$bed_abbrev/Results/
+
+mkdir $dir/$bed_abbrev/Results
+
+echo ${python} ${script_dir}/write_excel_results.py --directory $dir --file_header $file_header --panel $bed_abbrev --pipeline $dir/.tmp/${file_header}_provenance.txt --contam_json $dir/.tmp/${file_header}_${bed_abbrev}_contamination.json --gnomad_constraints ${gnomad_constraints} --broad_vcf_file ${location}/${file_header}_Variants.vcf --small_bed ${full_small_panel_bed} --bam_file $dir/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam --sambamba ${sambamba}
+${python} ${script_dir}/write_excel_results.py --directory $dir --file_header $file_header --panel $bed_abbrev --pipeline $dir/.tmp/${file_header}_provenance.txt --contam_json $dir/.tmp/${file_header}_${bed_abbrev}_contamination.json --gnomad_constraints ${gnomad_constraints} --broad_vcf_file ${location}/${file_header}_Variants.vcf --small_bed ${full_small_panel_bed} --bam_file $dir/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam --sambamba ${sambamba}
+
+chmod -R 777 $dir
+
+##CH: changed location of off target reads ${dir}/${file_header}_ReadsOffTarget.txt \
+${python} ${script_dir}/automated_qc.py \
+ --bam ${dir}/${file_header}_Aligned_Sorted_Clipped_PCRDuped.bam \
+ --vcf ${dir}/${file_header}_Variants.vcf \
+ --realigned_bam ${dir}/${file_header}_Aligned_Sorted_Clipped_PCRDuped_IndelsRealigned.bam \
+ --samtools_stats ${dir}/${bed_abbrev}/${file_header}_${bed_abbrev}_samtools_stats_all.json \
+ --median_insert ${dir}/${bed_abbrev}/${file_header}_${bed_abbrev}_median_insert.json \
+ --coverage_summary ${dir}/${bed_abbrev}/${file_header}_${bed_abbrev}_coverage_summary.txt \
+ --min_exon $minCoverageExonic \
+ --min_intron $minCoverageIntronic \
+ --set_min_exon 30 \
+ --set_min_intron 18 \
+ --gaps ${dir}/${bed_abbrev}/${file_header}_${bed_abbrev}_gaps_in_sequencing.txt \
+ --off_target_reads ${no_off_target} \
+ --total_reads ${tot_reads} \
+ --contamination ${dir}/${bed_abbrev}/${file_header}_${bed_abbrev}_contamination.json \
+ --variants $dir/${bed_abbrev}/${file_header}_${bed_abbrev}_dbSNP_COSMIC.vcf \
+ --lessLQ $dir/${bed_abbrev}/${file_header}_${bed_abbrev}_variants_LessLQs.vcf \
+ --lessLQPolys $dir/${bed_abbrev}/${file_header}_${bed_abbrev}_variants_LessLQsPolys.vcf \
+ --vcf_log ${dir}/${bed_abbrev}/${file_header}_${bed_abbrev}_logfile_preparing_vcf.txt \
+ --analysis_log ${dir}/${file_header}_analysis_log.txt \
+ --qc_file ${dir}/${bed_abbrev}/${file_header}_${bed_abbrev}_qc.json \
+ --polylist ${poly_list} \
+ --sex_check ${dir}/${file_header}_sex_check.json
+
+check_file $dir/$bed_abbrev/${file_header}_${bed_abbrev}_qc.json
+
+rm -rf $dir/.tmp/
+
+echo "Analysis finished on `date +"%a %b %d %T %Z %Y"`" >> $dir/${file_header}_analysis_log.txt
+
+${python} $script_dir/write_patient_model_json.py --analysis_log $dir/${file_header}_analysis_log.txt --output_file $dir/${file_header}_NGSPatient.json
